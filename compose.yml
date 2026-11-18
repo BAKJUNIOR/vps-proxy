@@ -1,18 +1,29 @@
+# Proxy commun du VPS : seul service qui écoute sur 80/443, il aiguille chaque domaine
+# vers le bon projet (Athl, ATC…). Les règles de chaque projet sont dans sites/<projet>/.
+name: vps-proxy
+
 services:
   proxy:
     image: nginx:1.23.3-alpine
-    container_name: athl-proxy
+    container_name: vps-proxy
     restart: always
     ports:
       - 80:80
       - 443:443
     volumes:
-      - ./db-athl.conf:/etc/nginx/conf.d/db-athl.conf
-      - ./api-athl.conf:/etc/nginx/conf.d/api-athl.conf
-      - ./web-athl.conf:/etc/nginx/conf.d/web-athl.conf
-      - ./bo-athl.conf:/etc/nginx/conf.d/bo-athl.conf
+      - ./nginx/00-sites.conf:/etc/nginx/conf.d/00-sites.conf:ro
+      - ./sites:/etc/nginx/sites:ro
       - certbot-etc:/etc/letsencrypt
       - webroot:/var/www/certbot
+    # Recharge nginx toutes les 6 h (sans coupure) pour prendre en compte les certificats
+    # renouvelés par certbot ; sinon nginx garderait l'ancien certificat en mémoire jusqu'à expiration.
+    command: /bin/sh -c 'while :; do sleep 6h & wait $${!}; nginx -s reload; done & exec nginx -g "daemon off;"'
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - applications-network
 
@@ -20,18 +31,30 @@ services:
   # et le renouvelle automatiquement — aucune intervention manuelle nécessaire après la mise en place.
   certbot:
     image: certbot/certbot
-    container_name: athl-certbot
+    container_name: vps-certbot
     restart: always
     volumes:
       - certbot-etc:/etc/letsencrypt
       - webroot:/var/www/certbot
     entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done;'"
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - applications-network
 
+# Volumes existants (créés à l'époque par l'ancien dossier athl-proxy) : ils contiennent
+# les certificats déjà émis. "external" = on les réutilise tels quels, sans jamais les recréer.
 volumes:
   certbot-etc:
+    external: true
+    name: athl-proxy_certbot-etc
   webroot:
+    external: true
+    name: athl-proxy_webroot
 
 networks:
   applications-network:

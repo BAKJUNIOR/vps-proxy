@@ -1,17 +1,22 @@
-name: deploy athl proxy
+name: deploy vps proxy
 on:
   push:
     branches:
       - master   # ne se déclenche QUE quand on push sur master
 env:
-  IMAGE: athl-proxy
-  VERSION: 0.0.1-SNAPSHOT
+  DEPLOY_DIR: /opt/application/infra/proxy
+  STAGE_DIR: /opt/application/infra/proxy-staging
+  # Ancien emplacement du proxy (avant la réorganisation du VPS) : arrêté au premier déploiement.
+  OLD_DIR: /opt/application/athl/athl-proxy
 jobs:
-  create-folder:
-    name: create folder
+  deploy:
+    name: deploy proxy
     runs-on: ubuntu-latest
     steps:
-      - name: execute commands
+      - name: cloner le repertoire
+        uses: actions/checkout@v4
+
+      - name: preparer le dossier de transit
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.HOST }}
@@ -19,25 +24,22 @@ jobs:
           key: ${{ secrets.PRIVATE_KEY }}
           port: 22
           script: |
-            mkdir /opt/application/athl/${{env.IMAGE}}
-            ls -al /opt/application/athl
-  run-container:
-    name: run container
-    runs-on: ubuntu-latest
-    needs: [ 'create-folder']
-    steps:
-      - name: cloner le repertoire
-        uses: actions/checkout@v4
-      - name: copy file via ssh key
+            rm -rf ${{ env.STAGE_DIR }}
+            mkdir -p ${{ env.STAGE_DIR }} ${{ env.DEPLOY_DIR }}
+
+      # Les fichiers arrivent d'abord dans un dossier de transit : le proxy en service
+      # n'est touché qu'une fois la nouvelle config validée.
+      - name: copier les fichiers
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.HOST }}
           username: ${{ secrets.USERNAME }}
           key: ${{ secrets.PRIVATE_KEY }}
           port: 22
-          source: "compose.yml,api-athl.conf,db-athl.conf,web-athl.conf,bo-athl.conf"
-          target: /opt/application/athl/${{env.IMAGE}}
-      - name: execute commands to run container
+          source: "compose.yml,nginx,sites"
+          target: ${{ env.STAGE_DIR }}
+
+      - name: valider puis lancer le proxy
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.HOST }}
@@ -45,7 +47,23 @@ jobs:
           key: ${{ secrets.PRIVATE_KEY }}
           port: 22
           script: |
-            docker compose -f /opt/application/athl/${{env.IMAGE}}/compose.yml up -d --force-recreate
-            # --force-recreate nécessaire : les .conf nginx sont montés en volume, pas dans
-            # l'image, donc "up -d" seul ne redémarre pas le conteneur quand seul le fichier
-            # de conf change sur le serveur — nginx garderait l'ancienne config en mémoire.
+            set -e
+            # 1. Vérifie la config nginx dans un conteneur jetable : si elle est fausse,
+            #    on s'arrête ici et le proxy en service continue de tourner sans coupure.
+            docker compose -f ${{ env.STAGE_DIR }}/compose.yml run --rm --no-deps -T proxy nginx -t
+
+            # 2. Remplace les fichiers en service par les nouveaux.
+            rm -rf ${{ env.DEPLOY_DIR }}/sites ${{ env.DEPLOY_DIR }}/nginx
+            cp -r ${{ env.STAGE_DIR }}/. ${{ env.DEPLOY_DIR }}/
+
+            # 3. Premier déploiement seulement : arrête l'ancien proxy pour libérer les ports 80/443.
+            #    "down" sans -v : les volumes (certificats) sont conservés.
+            if docker ps -a --format '{{.Names}}' | grep -qx athl-proxy; then
+              docker compose -f ${{ env.OLD_DIR }}/compose.yml down
+            fi
+
+            # 4. --force-recreate : les .conf sont montés en volume, "up -d" seul ne relirait pas
+            #    une conf modifiée.
+            docker compose -f ${{ env.DEPLOY_DIR }}/compose.yml up -d --force-recreate --remove-orphans
+            rm -rf ${{ env.STAGE_DIR }}
+            docker ps --filter name=vps-
